@@ -1,0 +1,1 @@
+Put your trained checkpoint.pth here and rename it to weather_calf_checkpoint.pth
