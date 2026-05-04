@@ -33,8 +33,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
 
 
 # ============================================================
@@ -66,6 +64,25 @@ DEFAULT_WEIGHT_RELATIVE_PLACEHOLDER = (
 )
 
 METRIC_NAMES = ["MAE", "MSE", "RMSE", "MAPE", "MSPE"]
+
+
+class SimpleStandardScaler:
+    """Minimal replacement for sklearn.preprocessing.StandardScaler.
+
+    It keeps the Streamlit Cloud app lightweight while preserving the same
+    inverse-scaling behavior needed for result visualization.
+    """
+
+    def fit(self, values: np.ndarray) -> "SimpleStandardScaler":
+        arr = np.asarray(values, dtype=float)
+        self.mean_ = np.nanmean(arr, axis=0)
+        self.scale_ = np.nanstd(arr, axis=0)
+        self.scale_ = np.where(self.scale_ == 0, 1.0, self.scale_)
+        return self
+
+    def inverse_transform(self, values: np.ndarray) -> np.ndarray:
+        arr = np.asarray(values, dtype=float)
+        return arr * self.scale_ + self.mean_
 
 
 # ============================================================
@@ -486,17 +503,17 @@ def load_result_arrays(result_dir: Path) -> Dict[str, np.ndarray]:
 # ============================================================
 
 
-def fit_train_scaler(df: pd.DataFrame, target: str) -> Tuple[StandardScaler, List[str], int]:
+def fit_train_scaler(df: pd.DataFrame, target: str) -> Tuple[SimpleStandardScaler, List[str], int]:
     ordered_df, feature_cols, target_idx = reorder_like_dataset_custom(df, target)
     num_train = int(len(ordered_df) * 0.7)
-    scaler = StandardScaler()
+    scaler = SimpleStandardScaler()
     scaler.fit(ordered_df[feature_cols].iloc[:num_train].values)
     return scaler, feature_cols, target_idx
 
 
 def inverse_target_values(
     values_1d: np.ndarray,
-    scaler: StandardScaler,
+    scaler: SimpleStandardScaler,
     n_features: int,
     target_idx: int,
 ) -> np.ndarray:
@@ -551,34 +568,32 @@ def display_metrics(metrics: Dict[str, float]) -> None:
             col.metric(name, f"{val:.6f}")
 
 
-def plot_forecast(
+def make_forecast_chart_data(
     history: np.ndarray,
     pred: np.ndarray,
     true: Optional[np.ndarray],
-    title: str,
-    target_name: str,
-) -> plt.Figure:
-    history = np.asarray(history).reshape(-1)
-    pred = np.asarray(pred).reshape(-1)
-    true = None if true is None else np.asarray(true).reshape(-1)
+) -> pd.DataFrame:
+    history = np.asarray(history, dtype=float).reshape(-1)
+    pred = np.asarray(pred, dtype=float).reshape(-1)
+    true = None if true is None else np.asarray(true, dtype=float).reshape(-1)
 
-    hist_x = np.arange(len(history))
-    fut_x = np.arange(len(history), len(history) + len(pred))
+    n_history = len(history)
+    n_future = len(pred)
+    total_len = n_history + n_future
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(hist_x, history, label="Observed history")
-    if true is not None and len(true) == len(pred):
-        ax.plot(fut_x, true, label="Future ground truth")
-    ax.plot(fut_x, pred, label="Forecast")
+    chart = pd.DataFrame(index=np.arange(total_len))
+    chart["Observed history"] = np.nan
+    chart.loc[: n_history - 1, "Observed history"] = history
 
-    ax.axvline(len(history) - 1, linestyle="--", linewidth=1)
-    ax.set_title(title)
-    ax.set_xlabel("Time step")
-    ax.set_ylabel(target_name)
-    ax.legend()
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-    return fig
+    chart["Forecast"] = np.nan
+    chart.loc[n_history : total_len - 1, "Forecast"] = pred
+
+    if true is not None and len(true) == n_future:
+        chart["Future ground truth"] = np.nan
+        chart.loc[n_history : total_len - 1, "Future ground truth"] = true
+
+    chart.index.name = "time_step"
+    return chart
 
 
 # ============================================================
@@ -795,20 +810,19 @@ def main() -> None:
             else:
                 st.caption("Ground truth is unavailable because the data is shorter than seq_len + pred_len.")
 
-            fig = plot_forecast(
-                history=history,
-                pred=pred,
-                true=true,
-                title="Placeholder forecast — not CALF output",
-                target_name=cfg.target,
-            )
-            st.pyplot(fig, clear_figure=True)
+            chart_df = make_forecast_chart_data(history=history, pred=pred, true=true)
+            st.line_chart(chart_df, use_container_width=True)
 
     # --------------------------------------------------------
     # Real CALF inference mode
     # --------------------------------------------------------
     with tab_real:
         st.subheader("Real CALF checkpoint inference")
+        st.warning(
+            "This lightweight Streamlit Cloud build does not install torch/transformers/peft by default. "
+            "Use this tab only in a local/Colab environment where CALF dependencies are installed. "
+            "For Streamlit Cloud, run CALF elsewhere and upload/load saved result arrays here."
+        )
 
         if not valid_project:
             st.error("CALF project files are missing. Real inference cannot run yet.")
@@ -967,14 +981,8 @@ def main() -> None:
                 st.write("**Target-only metrics for selected sample:**")
                 display_metrics(local_metrics)
 
-                fig = plot_forecast(
-                    history=history,
-                    pred=pred,
-                    true=true,
-                    title=f"CALF Weather Forecast — sample {sample_idx}",
-                    target_name=cfg.target,
-                )
-                st.pyplot(fig, clear_figure=True)
+                chart_df = make_forecast_chart_data(history=history, pred=pred, true=true)
+                st.line_chart(chart_df, use_container_width=True)
 
                 out_df = pd.DataFrame({
                     "step": np.arange(1, len(pred) + 1),
@@ -1005,14 +1013,8 @@ def main() -> None:
         st.code("\n".join(df.columns.astype(str)), language="text")
 
         target_series = df[cfg.target].astype(float).values
-        fig, ax = plt.subplots(figsize=(12, 4))
-        ax.plot(target_series[-min(len(target_series), 500):])
-        ax.set_title(f"Recent target values: {cfg.target}")
-        ax.set_xlabel("Recent time step")
-        ax.set_ylabel(cfg.target)
-        ax.grid(True, alpha=0.25)
-        fig.tight_layout()
-        st.pyplot(fig, clear_figure=True)
+        recent = target_series[-min(len(target_series), 500):]
+        st.line_chart(pd.DataFrame({cfg.target: recent}), use_container_width=True)
 
 
 if __name__ == "__main__":
