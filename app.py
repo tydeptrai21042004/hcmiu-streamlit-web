@@ -26,6 +26,7 @@ import sys
 import shlex
 import shutil
 import subprocess
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -499,6 +500,102 @@ def load_result_arrays(result_dir: Path) -> Dict[str, np.ndarray]:
 
 
 # ============================================================
+# Required-file import helpers
+# ============================================================
+
+
+def destination_for_imported_file(filename: str, cfg: CALFConfig) -> Optional[Path]:
+    """Map an uploaded filename to the correct app/CALF destination."""
+    base = Path(filename).name
+    lower = base.lower()
+
+    if lower == "weather.csv":
+        return cfg.project_dir / DEFAULT_DATA_RELATIVE
+
+    if lower == "wte_pca_500.pt":
+        return cfg.project_dir / "wte_pca_500.pt"
+
+    if lower in {"checkpoint.pth", "checkpoint.pt"}:
+        return expected_checkpoint_path(cfg)
+
+    if lower in {"metrics.npy", "pred.npy", "true.npy", "input.npy"}:
+        return expected_result_dir(cfg) / base
+
+    # Extra model files are kept safely instead of being ignored.
+    if lower.endswith((".pth", ".pt")):
+        return cfg.project_dir / "streamlit_uploaded_weights" / base
+
+    # Extra .npy files are kept with the result folder. Only pred/true/input/metrics
+    # are required for visualization, but this avoids losing useful experiment files.
+    if lower.endswith(".npy"):
+        return expected_result_dir(cfg) / base
+
+    return None
+
+
+def save_uploaded_required_file(uploaded_file, cfg: CALFConfig) -> Tuple[str, str, str]:
+    dest = destination_for_imported_file(uploaded_file.name, cfg)
+    if dest is None:
+        return uploaded_file.name, "Skipped", "Filename not recognized"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(uploaded_file.getvalue())
+    return uploaded_file.name, "Imported", str(dest)
+
+
+def import_required_zip(uploaded_zip, cfg: CALFConfig) -> List[Tuple[str, str, str]]:
+    rows: List[Tuple[str, str, str]] = []
+    try:
+        uploaded_zip.seek(0)
+        with zipfile.ZipFile(uploaded_zip) as zf:
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                base = Path(member.filename).name
+                if not base or base.startswith(".") or "__MACOSX" in member.filename:
+                    continue
+
+                dest = destination_for_imported_file(base, cfg)
+                if dest is None:
+                    rows.append((member.filename, "Skipped", "Filename not recognized"))
+                    continue
+
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as src:
+                    dest.write_bytes(src.read())
+                rows.append((member.filename, "Imported", str(dest)))
+    except zipfile.BadZipFile:
+        rows.append((uploaded_zip.name, "Error", "This file is not a valid zip archive"))
+    except Exception as exc:
+        rows.append((uploaded_zip.name, "Error", str(exc)))
+    return rows
+
+
+def required_file_status(cfg: CALFConfig) -> pd.DataFrame:
+    result_dir = expected_result_dir(cfg)
+    rows = [
+        ("weather.csv", cfg.project_dir / DEFAULT_DATA_RELATIVE, "Needed for data preview and CALF inference"),
+        ("wte_pca_500.pt", cfg.project_dir / "wte_pca_500.pt", "Needed only for real CALF inference"),
+        ("checkpoint.pth", expected_checkpoint_path(cfg), "Needed only for real CALF inference"),
+        ("pred.npy", result_dir / "pred.npy", "Needed for saved-result visualization"),
+        ("true.npy", result_dir / "true.npy", "Needed for saved-result visualization"),
+        ("input.npy", result_dir / "input.npy", "Optional, gives observed history in plots"),
+        ("metrics.npy", result_dir / "metrics.npy", "Optional, gives global metrics"),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "file": name,
+                "status": "OK" if path.exists() else "Missing",
+                "destination": str(path),
+                "note": note,
+            }
+            for name, path, note in rows
+        ]
+    )
+
+
+# ============================================================
 # Plotting / metrics helpers
 # ============================================================
 
@@ -784,9 +881,73 @@ def main() -> None:
         st.write("**Expected checkpoint path:**")
         st.code(str(expected_ckpt), language="text")
 
-    tab_demo, tab_real, tab_results, tab_data = st.tabs(
-        ["Demo placeholder", "Real CALF inference", "Load saved results", "Data preview"]
+    tab_import, tab_demo, tab_real, tab_results, tab_data = st.tabs(
+        [
+            "Import required files",
+            "Demo placeholder",
+            "Real CALF inference",
+            "Load saved results",
+            "Data preview",
+        ]
     )
+
+    # --------------------------------------------------------
+    # Required file import mode
+    # --------------------------------------------------------
+    with tab_import:
+        st.subheader("Import all required files")
+        st.info(
+            "Upload the files individually, or upload one zip file that contains them. "
+            "The app will copy each recognized file to the correct folder automatically."
+        )
+
+        st.markdown(
+            """
+            **Recognized filenames**
+
+            - `weather.csv` → saved to `datasets/weather/weather.csv`
+            - `wte_pca_500.pt` → saved to the CALF project root
+            - `checkpoint.pth` or `checkpoint.pt` → saved to the expected CALF checkpoint folder
+            - `pred.npy`, `true.npy`, `input.npy`, `metrics.npy` → saved to the expected result folder
+            - `.zip` → extracted and recognized files are imported automatically
+            """
+        )
+
+        uploaded_required_files = st.file_uploader(
+            "Upload required files or one zip archive",
+            type=["csv", "pt", "pth", "npy", "zip"],
+            accept_multiple_files=True,
+            key="required_files_uploader",
+        )
+
+        import_button = st.button("Import uploaded files", type="primary")
+
+        if import_button:
+            if not uploaded_required_files:
+                st.warning("Please choose at least one file first.")
+            else:
+                import_rows: List[Tuple[str, str, str]] = []
+                for uploaded_file in uploaded_required_files:
+                    if uploaded_file.name.lower().endswith(".zip"):
+                        import_rows.extend(import_required_zip(uploaded_file, cfg))
+                    else:
+                        try:
+                            import_rows.append(save_uploaded_required_file(uploaded_file, cfg))
+                        except Exception as exc:
+                            import_rows.append((uploaded_file.name, "Error", str(exc)))
+
+                imported_df = pd.DataFrame(import_rows, columns=["uploaded_file", "status", "destination_or_message"])
+                st.dataframe(imported_df, use_container_width=True)
+
+                if any(row[1] == "Imported" and row[0].lower().endswith(".npy") for row in import_rows):
+                    st.session_state["last_result_dir"] = str(expected_result_dir(cfg))
+
+                if any(row[1] == "Imported" for row in import_rows):
+                    st.success("Import finished. Open the saved-results tab to visualize `.npy` outputs, or the real-inference tab to run CALF.")
+
+        st.write("**Current required-file status:**")
+        status_df = required_file_status(cfg)
+        st.dataframe(status_df, use_container_width=True)
 
     # --------------------------------------------------------
     # Demo mode
