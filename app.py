@@ -583,36 +583,77 @@ def filename_from_content_disposition(content_disposition: Optional[str]) -> Opt
     return None
 
 
+def _html_attr(tag: str, name: str) -> Optional[str]:
+    """Return an HTML attribute value from a single tag string."""
+    match = re.search(rf'{name}\s*=\s*(["\'])(.*?)\1', tag, flags=re.IGNORECASE | re.DOTALL)
+    return html_lib.unescape(match.group(2)) if match else None
+
+
 def find_google_drive_confirm_url(html_text: str, current_url: str) -> Optional[str]:
-    """Find the second-step download URL from Google Drive's large-file warning page."""
+    """Find the second-step download URL from Google Drive's large-file warning page.
+
+    Google Drive changes this page often. This parser handles both the older
+    `confirm=` href flow and the newer warning form where input attributes may
+    appear in any order.
+    """
     text = html_lib.unescape(html_text)
 
     # Newer Google Drive pages often include a download form with hidden inputs.
     form_match = re.search(
-        r'<form[^>]+id="download-form"[^>]+action="([^"]+)"[^>]*>(.*?)</form>',
+        r'<form[^>]+id=["\']download-form["\'][^>]*>(.*?)</form>',
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if form_match:
-        action = form_match.group(1)
-        form_html = form_match.group(2)
-        params = dict(
-            re.findall(
-                r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"',
-                form_html,
-                flags=re.IGNORECASE,
-            )
-        )
+        form_tag_start = text.rfind("<form", 0, form_match.start(1))
+        form_tag_end = text.find(">", form_tag_start)
+        form_tag = text[form_tag_start : form_tag_end + 1] if form_tag_start >= 0 and form_tag_end >= 0 else ""
+        action = _html_attr(form_tag, "action") or "https://drive.google.com/uc"
+        form_html = form_match.group(1)
+        params: Dict[str, str] = {}
+        for input_match in re.finditer(r"<input\b[^>]*>", form_html, flags=re.IGNORECASE | re.DOTALL):
+            input_tag = input_match.group(0)
+            name = _html_attr(input_tag, "name")
+            if not name:
+                continue
+            params[name] = _html_attr(input_tag, "value") or ""
         if params:
             return urllib.parse.urljoin(current_url, action) + "?" + urllib.parse.urlencode(params)
 
     # Older pages expose a direct href containing confirm=...
-    href_match = re.search(r'href="([^"]*confirm=[^"]*)"', text, flags=re.IGNORECASE)
+    href_match = re.search(r'href=["\']([^"\']*confirm=[^"\']*)["\']', text, flags=re.IGNORECASE)
     if href_match:
         href = href_match.group(1).replace("&amp;", "&")
         return urllib.parse.urljoin(current_url, href)
 
     return None
+
+
+def google_drive_cookie_confirm_url(url: str, opener: urllib.request.OpenerDirector) -> Optional[str]:
+    """Resolve the older Google Drive confirm token stored in cookies."""
+    normalized_url = google_drive_download_url(url)
+    response = opener.open(
+        urllib.request.Request(normalized_url, headers={"User-Agent": "Mozilla/5.0"}),
+        timeout=60,
+    )
+    try:
+        for cookie in getattr(opener, "handlers", []):
+            pass
+        # CookieJar is attached to the HTTPCookieProcessor; easier path is to
+        # inspect Set-Cookie headers and extract download_warning tokens.
+        set_cookie_headers = response.headers.get_all("Set-Cookie") or []
+        confirm_token = None
+        for header in set_cookie_headers:
+            match = re.search(r"download_warning[^=]*=([^;]+)", header)
+            if match:
+                confirm_token = match.group(1)
+                break
+        if not confirm_token:
+            return None
+        sep = "&" if "?" in normalized_url else "?"
+        return normalized_url + sep + "confirm=" + urllib.parse.quote(confirm_token)
+    finally:
+        response.close()
 
 
 def open_download_response(url: str, opener: urllib.request.OpenerDirector):
@@ -631,8 +672,10 @@ def open_download_response(url: str, opener: urllib.request.OpenerDirector):
         response.close()
         if not confirm_url:
             raise RuntimeError(
-                "Google Drive did not return a downloadable file. "
-                "Make sure the file is shared as 'Anyone with the link can view'."
+                "Google Drive did not return a direct downloadable file. "
+                "This can happen when the file is private, blocked by Google Drive quota, "
+                "or Drive shows a large-file warning page that cannot be parsed. "
+                "Use the gdown downloader fallback or make sure the file is shared as 'Anyone with the link can view'."
             )
         request = urllib.request.Request(confirm_url, headers={"User-Agent": "Mozilla/5.0"})
         response = opener.open(request, timeout=60)
@@ -640,9 +683,67 @@ def open_download_response(url: str, opener: urllib.request.OpenerDirector):
     return response
 
 
+def download_google_drive_with_gdown(url: str, download_dir: Path, filename_override: str = "") -> Path:
+    """Download Google Drive files with gdown, which handles large-file confirm pages better."""
+    file_id = extract_google_drive_file_id(url)
+    if not file_id:
+        raise RuntimeError("This is not a recognized Google Drive file URL.")
+
+    filename = sanitize_filename(filename_override or "google_drive_download")
+    dest = download_dir / filename
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import gdown  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "The app needs the `gdown` package for large Google Drive files. "
+            "Run `pip install gdown`, or reinstall from the updated requirements.txt."
+        ) from exc
+
+    status = st.empty()
+    progress = st.progress(0, text=f"Starting Google Drive download: {filename}...")
+    candidates = [
+        url,
+        f"https://drive.google.com/uc?id={urllib.parse.quote(file_id)}",
+        f"https://drive.google.com/uc?export=download&id={urllib.parse.quote(file_id)}",
+    ]
+    last_error: Optional[Exception] = None
+
+    for candidate in candidates:
+        try:
+            status.write("Downloading from Google Drive. Large files may take several minutes...")
+            # fuzzy=True accepts /file/d/.../view URLs. quiet=False gives useful server logs.
+            result = gdown.download(candidate, str(dest), quiet=False, fuzzy=True)
+            if result and dest.exists() and dest.stat().st_size > 0:
+                progress.progress(1.0, text=f"Downloaded {filename}: {dest.stat().st_size / (1024**2):.1f} MB")
+                return dest
+            if dest.exists() and dest.stat().st_size == 0:
+                dest.unlink()
+        except Exception as exc:
+            last_error = exc
+            if dest.exists() and dest.stat().st_size == 0:
+                dest.unlink()
+
+    raise RuntimeError(
+        "Google Drive download failed. Please check that the file is shared as "
+        "'Anyone with the link can view', not restricted to your account. "
+        "If it is a very large file, Google Drive may also temporarily block downloads due to quota."
+        + (f" Last error: {last_error}" if last_error else "")
+    )
+
+
 def download_file_from_url(url: str, download_dir: Path, filename_override: str = "") -> Path:
     """Download a large file from Google Drive/direct URL by streaming it to disk."""
     download_dir.mkdir(parents=True, exist_ok=True)
+
+    # For Google Drive, prefer gdown because it handles the large-file warning
+    # and confirmation flow more reliably than manual urllib parsing.
+    if extract_google_drive_file_id(url):
+        try:
+            return download_google_drive_with_gdown(url, download_dir, filename_override=filename_override)
+        except Exception as gdown_exc:
+            st.warning(f"gdown failed; trying manual Google Drive/direct downloader. Details: {gdown_exc}")
 
     cookie_jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
@@ -1144,6 +1245,10 @@ def main() -> None:
             "Use this when Streamlit still shows 200MB upload limit. "
             "The file is downloaded by the server, so it does not go through `st.file_uploader`. "
             "For Google Drive, set sharing to **Anyone with the link can view**."
+        )
+        st.warning(
+            "For Google Drive links, choose the expected filename below, for example `checkpoint.pth`. "
+            "Auto-detect can fail for large Drive files because Google may hide the filename behind a confirmation page."
         )
 
         url_text = st.text_area(
