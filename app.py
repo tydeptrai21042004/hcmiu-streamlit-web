@@ -35,6 +35,21 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Large-upload helper: write uploaded files in chunks instead of duplicating
+# the whole file again with uploaded_file.getvalue().
+UPLOAD_COPY_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
+
+def write_uploaded_file(uploaded_file, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    uploaded_file.seek(0)
+    with dest.open("wb") as out:
+        while True:
+            chunk = uploaded_file.read(UPLOAD_COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            out.write(chunk)
+    uploaded_file.seek(0)
+
 
 # ============================================================
 # Streamlit page configuration
@@ -538,8 +553,7 @@ def save_uploaded_required_file(uploaded_file, cfg: CALFConfig) -> Tuple[str, st
     if dest is None:
         return uploaded_file.name, "Skipped", "Filename not recognized"
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(uploaded_file.getvalue())
+    write_uploaded_file(uploaded_file, dest)
     return uploaded_file.name, "Imported", str(dest)
 
 
@@ -845,8 +859,7 @@ def main() -> None:
     uploaded_csv = st.sidebar.file_uploader("Upload weather.csv", type=["csv"])
 
     if uploaded_csv is not None:
-        data_path.parent.mkdir(parents=True, exist_ok=True)
-        data_path.write_bytes(uploaded_csv.getvalue())
+        write_uploaded_file(uploaded_csv, data_path)
         st.sidebar.success(f"Uploaded CSV saved to {data_path}")
 
     if data_path.exists():
@@ -1013,7 +1026,7 @@ def main() -> None:
                 tmp_upload_dir = project_dir / "streamlit_uploaded_weights"
                 tmp_upload_dir.mkdir(parents=True, exist_ok=True)
                 uploaded_path = tmp_upload_dir / "checkpoint.pth"
-                uploaded_path.write_bytes(uploaded_ckpt.getvalue())
+                write_uploaded_file(uploaded_ckpt, uploaded_path)
                 selected_ckpt_path = uploaded_path
                 st.success(f"Uploaded checkpoint saved to {uploaded_path}")
             elif manual_ckpt_path.strip():

@@ -17,6 +17,20 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+
+---
+
+## 1 GB upload support
+
+This package includes `.streamlit/config.toml`:
+
+```toml
+[server]
+maxUploadSize = 1024
+```
+
+This allows `st.file_uploader` to accept files up to about 1 GB when the server has enough RAM and disk space. For very large `checkpoint.pth` files, the recommended local method is still to copy the file directly into `weights/` or into the expected CALF checkpoint folder, then enter the path in the app instead of uploading through the browser.
+
 ---
 
 ## Important folder structure
