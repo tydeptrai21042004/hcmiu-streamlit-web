@@ -14,9 +14,10 @@
 #     datasets/weather/weather.csv
 #     checkpoints/<setting>/checkpoint.pth
 #
-# This app has two modes:
+# This app has three modes:
 #   1) Demo placeholder mode: works even without a real checkpoint.
-#   2) Real CALF inference mode: uses your trained Weather checkpoint.pth.
+#   2) ONNX inference mode: uses calf_weather_forecast.onnx with onnxruntime only.
+#   3) Legacy real CALF inference mode: uses PyTorch checkpoint.pth when available.
 
 from __future__ import annotations
 
@@ -75,6 +76,12 @@ st.set_page_config(
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_PROJECT_DIR = os.getenv("CALF_PROJECT_DIR", str(APP_DIR / "CALF"))
 LOCAL_APP_WEIGHT_PATH = APP_DIR / "weights" / "weather_calf_checkpoint.pth"
+LOCAL_APP_ONNX_PATH = APP_DIR / "weights" / "calf_weather_forecast.onnx"
+ONNX_FILENAME_ALIASES = {
+    "calf_weather_forecast.onnx",
+    "calf_forecast.onnx",
+    "model.onnx",
+}
 DEFAULT_DATA_RELATIVE = "datasets/weather/weather.csv"
 DEFAULT_WEIGHT_RELATIVE_PLACEHOLDER = (
     "checkpoints/"
@@ -149,7 +156,7 @@ def show_header() -> None:
     st.title("🌦️ CALF Weather Forecasting Demo")
     st.caption(
         "Streamlit interface for your CALF long-term forecasting model. "
-        "Use placeholder mode now, then switch to real checkpoint inference after training."
+        "Use placeholder mode for UI testing, then switch to ONNX inference after exporting your CALF model."
     )
 
 
@@ -843,6 +850,11 @@ def destination_for_imported_file(filename: str, cfg: CALFConfig) -> Optional[Pa
     if lower == "wte_pca_500.pt":
         return cfg.project_dir / "wte_pca_500.pt"
 
+    if lower in ONNX_FILENAME_ALIASES or lower.endswith(".onnx") or lower.endswith(".onxr"):
+        # Store all ONNX/ONXR uploads under a stable filename.
+        # If the user accidentally names the ONNX file .onxr, keep the contents but save as .onnx.
+        return expected_onnx_path()
+
     if lower in {"checkpoint.pth", "checkpoint.pt"}:
         return expected_checkpoint_path(cfg)
 
@@ -901,9 +913,10 @@ def import_required_zip(uploaded_zip, cfg: CALFConfig) -> List[Tuple[str, str, s
 def required_file_status(cfg: CALFConfig) -> pd.DataFrame:
     result_dir = expected_result_dir(cfg)
     rows = [
-        ("weather.csv", cfg.project_dir / DEFAULT_DATA_RELATIVE, "Needed for data preview and CALF inference"),
-        ("wte_pca_500.pt", cfg.project_dir / "wte_pca_500.pt", "Needed only for real CALF inference"),
-        ("checkpoint.pth", expected_checkpoint_path(cfg), "Needed only for real CALF inference"),
+        ("weather.csv", cfg.project_dir / DEFAULT_DATA_RELATIVE, "Needed for data preview and ONNX/CALF inference"),
+        ("calf_weather_forecast.onnx", expected_onnx_path(), "Needed for ONNX inference without torch"),
+        ("wte_pca_500.pt", cfg.project_dir / "wte_pca_500.pt", "Needed only for legacy PyTorch CALF inference"),
+        ("checkpoint.pth", expected_checkpoint_path(cfg), "Needed only for legacy PyTorch CALF inference"),
         ("pred.npy", result_dir / "pred.npy", "Needed for saved-result visualization"),
         ("true.npy", result_dir / "true.npy", "Needed for saved-result visualization"),
         ("input.npy", result_dir / "input.npy", "Optional, gives observed history in plots"),
@@ -1019,6 +1032,151 @@ def make_forecast_chart_data(
     chart.index.name = "time_step"
     return chart
 
+
+
+# ============================================================
+# ONNX inference helpers
+# ============================================================
+
+
+def expected_onnx_path() -> Path:
+    """Default ONNX model path used by the Streamlit app."""
+    return LOCAL_APP_ONNX_PATH
+
+
+def find_available_onnx_model(project_dir: Path) -> Optional[Path]:
+    """Find a usable ONNX model in the common app/project locations."""
+    candidates = [
+        LOCAL_APP_ONNX_PATH,
+        APP_DIR / "calf_weather_forecast.onnx",
+        APP_DIR / "calf_forecast.onnx",
+        project_dir / "calf_weather_forecast.onnx",
+        project_dir / "calf_forecast.onnx",
+        project_dir / "weights" / "calf_weather_forecast.onnx",
+        project_dir / "weights" / "calf_forecast.onnx",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def get_onnx_io_info(onnx_path: Path) -> Dict[str, str]:
+    """Return lightweight ONNX input/output metadata."""
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    inputs = session.get_inputs()
+    outputs = session.get_outputs()
+    return {
+        "input_name": inputs[0].name,
+        "input_shape": str(inputs[0].shape),
+        "input_type": str(inputs[0].type),
+        "output_name": outputs[0].name,
+        "output_shape": str(outputs[0].shape),
+        "output_type": str(outputs[0].type),
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def load_onnx_session_cached(path_str: str):
+    """Cache ONNXRuntime session so repeated predictions are fast."""
+    import onnxruntime as ort
+
+    return ort.InferenceSession(path_str, providers=["CPUExecutionProvider"])
+
+
+def build_onnx_window(
+    df: pd.DataFrame,
+    cfg: CALFConfig,
+    mode: str,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], SimpleStandardScaler, List[str], int]:
+    """Prepare one normalized input window for ONNXRuntime.
+
+    The exported ONNX model expects the same normalized data used by CALF.
+    We reproduce Dataset_Custom-style column order and StandardScaler behavior.
+    """
+    ordered_df, feature_cols, target_idx = reorder_like_dataset_custom(df, cfg.target)
+    values = ordered_df[feature_cols].astype(float).values
+
+    if len(values) < cfg.seq_len:
+        raise ValueError(f"Need at least seq_len={cfg.seq_len} rows, but CSV only has {len(values)} rows.")
+
+    scaler = SimpleStandardScaler()
+    num_train = max(1, int(len(values) * 0.7))
+    scaler.fit(values[:num_train])
+    values_scaled = (values - scaler.mean_) / scaler.scale_
+
+    if mode == "Backtest last window with ground truth":
+        if len(values_scaled) < cfg.seq_len + cfg.pred_len:
+            raise ValueError(
+                f"Backtest mode needs at least seq_len + pred_len = {cfg.seq_len + cfg.pred_len} rows, "
+                f"but CSV only has {len(values_scaled)} rows. Use future-forecast mode instead."
+            )
+        x_scaled = values_scaled[-(cfg.seq_len + cfg.pred_len): -cfg.pred_len]
+        history_raw = values[-(cfg.seq_len + cfg.pred_len): -cfg.pred_len, target_idx]
+        true_raw = values[-cfg.pred_len:, target_idx]
+    else:
+        x_scaled = values_scaled[-cfg.seq_len:]
+        history_raw = values[-cfg.seq_len:, target_idx]
+        true_raw = None
+
+    x = x_scaled[np.newaxis, :, :].astype(np.float32)
+    return x, history_raw.astype(float), true_raw, scaler, feature_cols, target_idx
+
+
+def run_onnx_forecast(
+    onnx_path: Path,
+    df: pd.DataFrame,
+    cfg: CALFConfig,
+    mode: str,
+    save_result: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Dict[str, float], Path]:
+    """Run ONNX inference and optionally save pred/true/input/metrics npy files."""
+    x, history_raw, true_raw, scaler, feature_cols, target_idx = build_onnx_window(df, cfg, mode)
+
+    session = load_onnx_session_cached(str(onnx_path.resolve()))
+    input_meta = session.get_inputs()[0]
+    output_meta = session.get_outputs()[0]
+
+    expected_features = input_meta.shape[-1]
+    if isinstance(expected_features, int) and expected_features != x.shape[-1]:
+        raise ValueError(
+            f"ONNX model expects {expected_features} input features, but current CSV has {x.shape[-1]}. "
+            "Use the same Weather CSV/features used when exporting ONNX."
+        )
+
+    pred_scaled = session.run([output_meta.name], {input_meta.name: x})[0]
+    pred_target_scaled = extract_series(pred_scaled, 0, target_idx)
+
+    # Convert normalized target prediction back to original Weather scale.
+    pred_raw = inverse_target_values(
+        pred_target_scaled,
+        scaler=scaler,
+        n_features=len(feature_cols),
+        target_idx=target_idx,
+    )
+
+    metrics: Dict[str, float] = {}
+    if true_raw is not None and len(true_raw) == len(pred_raw):
+        metrics = calculate_basic_metrics(true_raw, pred_raw)
+
+    result_dir = expected_result_dir(cfg)
+    if save_result:
+        result_dir.mkdir(parents=True, exist_ok=True)
+        np.save(result_dir / "input.npy", x)
+        np.save(result_dir / "pred.npy", pred_scaled)
+        if true_raw is not None:
+            # Save a CALF-like true.npy so the existing saved-results tab can read it.
+            # Only the target channel is needed for plotting; other channels are zero.
+            true_scaled = np.zeros((1, len(true_raw), len(feature_cols)), dtype=np.float32)
+            true_scaled[0, :, target_idx] = (true_raw - scaler.mean_[target_idx]) / scaler.scale_[target_idx]
+            np.save(result_dir / "true.npy", true_scaled)
+            np.save(result_dir / "true_target_raw.npy", true_raw)
+        if metrics:
+            np.save(result_dir / "metrics.npy", np.array([metrics.get(k, np.nan) for k in METRIC_NAMES]))
+
+    return history_raw, pred_raw, true_raw, metrics, result_dir
 
 # ============================================================
 # Placeholder forecasting
@@ -1207,11 +1365,12 @@ def main() -> None:
         st.write("**Expected checkpoint path:**")
         st.code(str(expected_ckpt), language="text")
 
-    tab_import, tab_demo, tab_real, tab_results, tab_data = st.tabs(
+    tab_import, tab_demo, tab_onnx, tab_real, tab_results, tab_data = st.tabs(
         [
             "Import required files",
             "Demo placeholder",
-            "Real CALF inference",
+            "ONNX inference",
+            "Legacy PyTorch CALF",
             "Load saved results",
             "Data preview",
         ]
@@ -1232,8 +1391,10 @@ def main() -> None:
             **Recognized filenames**
 
             - `weather.csv` → saved to `datasets/weather/weather.csv`
-            - `wte_pca_500.pt` → saved to the CALF project root
-            - `checkpoint.pth` or `checkpoint.pt` → saved to the expected CALF checkpoint folder
+            - `calf_weather_forecast.onnx`, `calf_forecast.onnx`, `model.onnx`, or any `.onnx`/`.onxr` → saved to `weights/calf_weather_forecast.onnx`
+            - `weather.csv` → saved to `datasets/weather/weather.csv`
+            - `wte_pca_500.pt` → saved to the CALF project root, only for legacy PyTorch mode
+            - `checkpoint.pth` or `checkpoint.pt` → saved to the expected CALF checkpoint folder, only for legacy PyTorch mode
             - `pred.npy`, `true.npy`, `input.npy`, `metrics.npy` → saved to the expected result folder
             - `.zip` → extracted and recognized files are imported automatically
             """
@@ -1261,6 +1422,7 @@ def main() -> None:
             "Save downloaded file as",
             [
                 "Auto detect from downloaded filename",
+                "calf_weather_forecast.onnx",
                 "weather.csv",
                 "wte_pca_500.pt",
                 "checkpoint.pth",
@@ -1323,7 +1485,7 @@ def main() -> None:
 
         uploaded_required_files = st.file_uploader(
             "Upload required files or one zip archive",
-            type=["csv", "pt", "pth", "npy", "zip"],
+            type=["csv", "pt", "pth", "npy", "onnx", "onxr", "zip"],
             accept_multiple_files=True,
             key="required_files_uploader",
         )
@@ -1351,7 +1513,7 @@ def main() -> None:
                     st.session_state["last_result_dir"] = str(expected_result_dir(cfg))
 
                 if any(row[1] == "Imported" for row in import_rows):
-                    st.success("Import finished. Open the saved-results tab to visualize `.npy` outputs, or the real-inference tab to run CALF.")
+                    st.success("Import finished. Open the ONNX inference tab to run `.onnx`, or the saved-results tab to visualize `.npy` outputs.")
 
         st.write("**Current required-file status:**")
         status_df = required_file_status(cfg)
@@ -1364,7 +1526,7 @@ def main() -> None:
         st.subheader("Demo placeholder forecast")
         st.info(
             "This mode is only for UI testing. It does not use CALF weights. "
-            "Use the Real CALF inference tab after placing/uploading checkpoint.pth."
+            "Use the ONNX inference tab after importing `calf_weather_forecast.onnx`."
         )
 
         if st.button("Run placeholder forecast", type="primary"):
@@ -1383,10 +1545,108 @@ def main() -> None:
             st.line_chart(chart_df, use_container_width=True)
 
     # --------------------------------------------------------
+    # ONNX inference mode
+    # --------------------------------------------------------
+    with tab_onnx:
+        st.subheader("ONNX inference without torch")
+        st.success(
+            "Use this tab with your exported `calf_weather_forecast.onnx`. "
+            "It runs with `onnxruntime` only, so Streamlit Cloud does not need torch, transformers, or peft."
+        )
+
+        current_onnx = find_available_onnx_model(project_dir)
+        default_onnx_text = str(current_onnx if current_onnx is not None else expected_onnx_path())
+
+        onnx_path_text = st.text_input(
+            "ONNX model path",
+            value=default_onnx_text,
+            help="Upload/import your ONNX file first, or paste the path to an existing .onnx file.",
+        )
+        onnx_path = Path(onnx_path_text).expanduser().resolve()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("ONNX model", "OK" if onnx_path.exists() else "Missing")
+        c2.metric("Weather CSV", "OK" if data_path.exists() else "Synthetic")
+        c3.metric("Input features", cfg.enc_in)
+
+        if onnx_path.exists():
+            try:
+                info = get_onnx_io_info(onnx_path)
+                with st.expander("ONNX model info", expanded=False):
+                    st.json(info)
+            except Exception as exc:
+                st.warning(f"Could not read ONNX metadata yet: {exc}")
+
+        forecast_mode = st.radio(
+            "Forecast mode",
+            ["Backtest last window with ground truth", "Forecast after latest row"],
+            index=0,
+            help=(
+                "Backtest uses the final seq_len + pred_len rows, so the app can compare prediction with existing ground truth. "
+                "Forecast-after-latest uses the final seq_len rows and predicts future values without ground truth."
+            ),
+        )
+
+        save_onnx_results = st.checkbox(
+            "Save ONNX output arrays to the expected result folder",
+            value=True,
+        )
+
+        if st.button("Run ONNX Weather inference", type="primary"):
+            try:
+                if not onnx_path.exists():
+                    raise FileNotFoundError(
+                        f"ONNX model not found: {onnx_path}. Import `calf_weather_forecast.onnx` first."
+                    )
+
+                history, pred, true, metrics, result_dir = run_onnx_forecast(
+                    onnx_path=onnx_path,
+                    df=df,
+                    cfg=cfg,
+                    mode=forecast_mode,
+                    save_result=save_onnx_results,
+                )
+
+                st.session_state["last_result_dir"] = str(result_dir)
+
+                if metrics:
+                    st.write("**Backtest metrics on target column:**")
+                    display_metrics(metrics)
+                else:
+                    st.info("Ground truth is not available in future-forecast mode, so metrics are not computed.")
+
+                chart_df = make_forecast_chart_data(history=history, pred=pred, true=true)
+                st.line_chart(chart_df, use_container_width=True)
+
+                out_df = pd.DataFrame({
+                    "step": np.arange(1, len(pred) + 1),
+                    "forecast": pred,
+                })
+                if true is not None and len(true) == len(pred):
+                    out_df["ground_truth"] = true
+                    out_df["absolute_error"] = np.abs(true - pred)
+
+                st.write("**Forecast table:**")
+                st.dataframe(out_df, use_container_width=True)
+
+                st.download_button(
+                    "Download ONNX forecast CSV",
+                    data=out_df.to_csv(index=False).encode("utf-8"),
+                    file_name="calf_weather_onnx_forecast.csv",
+                    mime="text/csv",
+                )
+
+                if save_onnx_results:
+                    st.success(f"Saved ONNX output files to: {result_dir}")
+
+            except Exception as exc:
+                st.exception(exc)
+
+    # --------------------------------------------------------
     # Real CALF inference mode
     # --------------------------------------------------------
     with tab_real:
-        st.subheader("Real CALF checkpoint inference")
+        st.subheader("Legacy PyTorch CALF checkpoint inference")
         st.warning(
             "This lightweight Streamlit Cloud build does not install torch/transformers/peft by default. "
             "Use this tab only in a local/Colab environment where CALF dependencies are installed. "

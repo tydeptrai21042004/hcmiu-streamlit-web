@@ -1,0 +1,5 @@
+Put your exported ONNX model here with this exact name:
+
+calf_weather_forecast.onnx
+
+The Streamlit app also accepts upload/Google Drive import and will save any .onnx/.onxr file to this location automatically.
