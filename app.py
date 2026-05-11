@@ -27,6 +27,10 @@ import shlex
 import shutil
 import subprocess
 import zipfile
+import html as html_lib
+import http.cookiejar
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -38,6 +42,7 @@ import streamlit as st
 # Large-upload helper: write uploaded files in chunks instead of duplicating
 # the whole file again with uploaded_file.getvalue().
 UPLOAD_COPY_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
+URL_DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB
 
 def write_uploaded_file(uploaded_file, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -514,6 +519,213 @@ def load_result_arrays(result_dir: Path) -> Dict[str, np.ndarray]:
     return arrays
 
 
+
+# ============================================================
+# Google Drive / direct URL import helpers
+# ============================================================
+
+
+def sanitize_filename(filename: str, fallback: str = "downloaded_file") -> str:
+    """Keep only a safe basename for files downloaded from URLs."""
+    name = Path(filename or fallback).name.strip().strip('"').strip("'")
+    name = re.sub(r"[^A-Za-z0-9._ -]", "_", name)
+    name = name.strip(" .")
+    return name or fallback
+
+
+def extract_google_drive_file_id(url: str) -> Optional[str]:
+    """Extract a file id from common Google Drive sharing URLs."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    if "drive.google.com" not in host and "docs.google.com" not in host:
+        return None
+
+    qs = urllib.parse.parse_qs(parsed.query)
+    if qs.get("id"):
+        return qs["id"][0]
+
+    patterns = [
+        r"/file/d/([^/]+)",
+        r"/uc\?[^#]*id=([^&]+)",
+        r"/open\?[^#]*id=([^&]+)",
+        r"/document/d/([^/]+)",
+        r"/spreadsheets/d/([^/]+)",
+        r"/presentation/d/([^/]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return urllib.parse.unquote(match.group(1))
+    return None
+
+
+def google_drive_download_url(url: str) -> str:
+    file_id = extract_google_drive_file_id(url)
+    if not file_id:
+        return url
+    return f"https://drive.google.com/uc?export=download&id={urllib.parse.quote(file_id)}"
+
+
+def filename_from_content_disposition(content_disposition: Optional[str]) -> Optional[str]:
+    if not content_disposition:
+        return None
+
+    # RFC 5987 form: filename*=UTF-8''file.ext
+    match = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition, flags=re.IGNORECASE)
+    if match:
+        return urllib.parse.unquote(match.group(1).strip())
+
+    # Common form: filename="file.ext"
+    match = re.search(r'filename="?([^";]+)"?', content_disposition, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
+    return None
+
+
+def find_google_drive_confirm_url(html_text: str, current_url: str) -> Optional[str]:
+    """Find the second-step download URL from Google Drive's large-file warning page."""
+    text = html_lib.unescape(html_text)
+
+    # Newer Google Drive pages often include a download form with hidden inputs.
+    form_match = re.search(
+        r'<form[^>]+id="download-form"[^>]+action="([^"]+)"[^>]*>(.*?)</form>',
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if form_match:
+        action = form_match.group(1)
+        form_html = form_match.group(2)
+        params = dict(
+            re.findall(
+                r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"',
+                form_html,
+                flags=re.IGNORECASE,
+            )
+        )
+        if params:
+            return urllib.parse.urljoin(current_url, action) + "?" + urllib.parse.urlencode(params)
+
+    # Older pages expose a direct href containing confirm=...
+    href_match = re.search(r'href="([^"]*confirm=[^"]*)"', text, flags=re.IGNORECASE)
+    if href_match:
+        href = href_match.group(1).replace("&amp;", "&")
+        return urllib.parse.urljoin(current_url, href)
+
+    return None
+
+
+def open_download_response(url: str, opener: urllib.request.OpenerDirector):
+    """Open a URL, including Google Drive's large-file confirmation flow."""
+    normalized_url = google_drive_download_url(url)
+    request = urllib.request.Request(normalized_url, headers={"User-Agent": "Mozilla/5.0"})
+    response = opener.open(request, timeout=60)
+
+    content_type = response.headers.get("Content-Type", "").lower()
+    content_disposition = response.headers.get("Content-Disposition")
+
+    # If Google Drive returns an HTML warning/permission page, resolve the real file link.
+    if "text/html" in content_type and not content_disposition and "google" in response.geturl().lower():
+        html_text = response.read().decode("utf-8", errors="ignore")
+        confirm_url = find_google_drive_confirm_url(html_text, response.geturl())
+        response.close()
+        if not confirm_url:
+            raise RuntimeError(
+                "Google Drive did not return a downloadable file. "
+                "Make sure the file is shared as 'Anyone with the link can view'."
+            )
+        request = urllib.request.Request(confirm_url, headers={"User-Agent": "Mozilla/5.0"})
+        response = opener.open(request, timeout=60)
+
+    return response
+
+
+def download_file_from_url(url: str, download_dir: Path, filename_override: str = "") -> Path:
+    """Download a large file from Google Drive/direct URL by streaming it to disk."""
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+
+    response = open_download_response(url, opener)
+    try:
+        cd_name = filename_from_content_disposition(response.headers.get("Content-Disposition"))
+        url_name = Path(urllib.parse.urlparse(response.geturl()).path).name
+        fallback_name = cd_name or url_name or "downloaded_file"
+        filename = sanitize_filename(filename_override or fallback_name)
+        dest = download_dir / filename
+
+        total_header = response.headers.get("Content-Length")
+        total_bytes = int(total_header) if total_header and total_header.isdigit() else 0
+
+        progress = st.progress(0, text=f"Downloading {filename}...")
+        status = st.empty()
+        downloaded = 0
+
+        with dest.open("wb") as out:
+            while True:
+                chunk = response.read(URL_DOWNLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                out.write(chunk)
+                downloaded += len(chunk)
+                if total_bytes > 0:
+                    progress.progress(
+                        min(downloaded / total_bytes, 1.0),
+                        text=f"Downloading {filename}: {downloaded / (1024**2):.1f} / {total_bytes / (1024**2):.1f} MB",
+                    )
+                else:
+                    status.write(f"Downloaded {downloaded / (1024**2):.1f} MB...")
+
+        progress.progress(1.0, text=f"Downloaded {filename}: {downloaded / (1024**2):.1f} MB")
+        return dest
+    finally:
+        response.close()
+
+
+def import_required_zip_path(zip_path: Path, cfg: CALFConfig) -> List[Tuple[str, str, str]]:
+    """Import recognized files from a ZIP already stored on disk."""
+    rows: List[Tuple[str, str, str]] = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                base = Path(member.filename).name
+                if not base or base.startswith(".") or "__MACOSX" in member.filename:
+                    continue
+
+                dest = destination_for_imported_file(base, cfg)
+                if dest is None:
+                    rows.append((member.filename, "Skipped", "Filename not recognized"))
+                    continue
+
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as src, dest.open("wb") as out:
+                    shutil.copyfileobj(src, out, length=UPLOAD_COPY_CHUNK_SIZE)
+                rows.append((member.filename, "Imported", str(dest)))
+    except zipfile.BadZipFile:
+        rows.append((zip_path.name, "Error", "This file is not a valid zip archive"))
+    except Exception as exc:
+        rows.append((zip_path.name, "Error", str(exc)))
+    return rows
+
+
+def import_downloaded_required_file(src_path: Path, cfg: CALFConfig, import_filename: str = "") -> List[Tuple[str, str, str]]:
+    """Import one downloaded file using the same recognized-filename rules as uploads."""
+    effective_name = sanitize_filename(import_filename or src_path.name)
+
+    if effective_name.lower().endswith(".zip") or src_path.suffix.lower() == ".zip":
+        return import_required_zip_path(src_path, cfg)
+
+    dest = destination_for_imported_file(effective_name, cfg)
+    if dest is None:
+        return [(effective_name, "Skipped", "Filename not recognized")]
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_path, dest)
+    return [(effective_name, "Imported", str(dest))]
+
 # ============================================================
 # Required-file import helpers
 # ============================================================
@@ -575,8 +787,8 @@ def import_required_zip(uploaded_zip, cfg: CALFConfig) -> List[Tuple[str, str, s
                     continue
 
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(member) as src:
-                    dest.write_bytes(src.read())
+                with zf.open(member) as src, dest.open("wb") as out:
+                    shutil.copyfileobj(src, out, length=UPLOAD_COPY_CHUNK_SIZE)
                 rows.append((member.filename, "Imported", str(dest)))
     except zipfile.BadZipFile:
         rows.append((uploaded_zip.name, "Error", "This file is not a valid zip archive"))
@@ -925,6 +1137,84 @@ def main() -> None:
             - `.zip` → extracted and recognized files are imported automatically
             """
         )
+
+        st.divider()
+        st.markdown("### Download from Google Drive or direct URL")
+        st.caption(
+            "Use this when Streamlit still shows 200MB upload limit. "
+            "The file is downloaded by the server, so it does not go through `st.file_uploader`. "
+            "For Google Drive, set sharing to **Anyone with the link can view**."
+        )
+
+        url_text = st.text_area(
+            "Google Drive / direct download URL",
+            placeholder="Paste one URL per line, for example: https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing",
+            key="url_import_text",
+        )
+
+        url_import_type = st.selectbox(
+            "Save downloaded file as",
+            [
+                "Auto detect from downloaded filename",
+                "weather.csv",
+                "wte_pca_500.pt",
+                "checkpoint.pth",
+                "pred.npy",
+                "true.npy",
+                "input.npy",
+                "metrics.npy",
+                "archive.zip",
+            ],
+            help="Choose the expected filename if the Google Drive link does not expose the real filename.",
+        )
+
+        url_filename_override = st.text_input(
+            "Optional custom filename override",
+            value="",
+            help="Usually leave empty. Use this if Auto detect gives a wrong name.",
+        )
+
+        download_import_button = st.button("Download URL and import", type="secondary")
+
+        if download_import_button:
+            urls = [line.strip() for line in url_text.splitlines() if line.strip()]
+            if not urls:
+                st.warning("Please paste at least one Google Drive or direct download URL.")
+            else:
+                import_rows: List[Tuple[str, str, str]] = []
+                download_dir = cfg.project_dir / "streamlit_url_downloads"
+
+                for idx, url in enumerate(urls, start=1):
+                    try:
+                        canonical_name = "" if url_import_type == "Auto detect from downloaded filename" else url_import_type
+                        filename_override = url_filename_override.strip() or canonical_name
+                        if len(urls) > 1 and url_filename_override.strip():
+                            stem = Path(url_filename_override.strip()).stem
+                            suffix = Path(url_filename_override.strip()).suffix
+                            filename_override = f"{stem}_{idx}{suffix}"
+
+                        downloaded_path = download_file_from_url(url, download_dir, filename_override=filename_override)
+                        st.success(f"Downloaded to: {downloaded_path}")
+
+                        imported = import_downloaded_required_file(
+                            downloaded_path,
+                            cfg,
+                            import_filename=canonical_name or downloaded_path.name,
+                        )
+                        import_rows.extend(imported)
+                    except Exception as exc:
+                        import_rows.append((url, "Error", str(exc)))
+
+                imported_df = pd.DataFrame(import_rows, columns=["downloaded_file_or_url", "status", "destination_or_message"])
+                st.dataframe(imported_df, use_container_width=True)
+
+                if any(row[1] == "Imported" and row[0].lower().endswith(".npy") for row in import_rows):
+                    st.session_state["last_result_dir"] = str(expected_result_dir(cfg))
+
+                if any(row[1] == "Imported" for row in import_rows):
+                    st.success("URL import finished. Check the required-file status below.")
+
+        st.divider()
 
         uploaded_required_files = st.file_uploader(
             "Upload required files or one zip archive",
