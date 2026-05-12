@@ -1785,8 +1785,15 @@ def main() -> None:
                 shape_info = {k: str(v.shape) for k, v in arrays.items()}
                 st.json(shape_info)
 
-                n_samples = pred_arr.shape[0] if pred_arr.ndim == 3 else 1
-                sample_idx = st.slider("Sample index", 0, max(0, n_samples - 1), 0)
+                n_samples = int(pred_arr.shape[0]) if pred_arr.ndim == 3 else 1
+
+                # Streamlit slider requires min_value < max_value.
+                # For a single saved sample, there is nothing to select.
+                if n_samples <= 1:
+                    sample_idx = 0
+                    st.info("Only one sample is available, so sample index is fixed to 0.")
+                else:
+                    sample_idx = st.slider("Sample index", 0, n_samples - 1, 0)
 
                 scaler, feature_cols, target_idx = fit_train_scaler(df, cfg.target)
                 n_features = len(feature_cols)
