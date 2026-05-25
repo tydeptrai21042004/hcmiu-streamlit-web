@@ -1,12 +1,10 @@
-# results/
-
-Optional place for saved CALF result arrays.
-
-A result folder should contain:
+Optional saved result arrays can be placed here:
 
 ```text
-input.npy
 pred.npy
 true.npy
+input.npy
 metrics.npy
 ```
+
+You can also upload them through the Streamlit UI.
