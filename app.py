@@ -446,6 +446,101 @@ def run_onnx_forecast(df: pd.DataFrame, cfg: ForecastConfig) -> Tuple[np.ndarray
     return history_raw, pred_raw, true_raw, metrics
 
 
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Correlation helper used by the demo baseline."""
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    n = min(len(a), len(b))
+    if n < 8:
+        return -np.inf
+    a = a[:n] - np.mean(a[:n])
+    b = b[:n] - np.mean(b[:n])
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 1e-12:
+        return -np.inf
+    return float(np.dot(a, b) / denom)
+
+
+def infer_weather_period(history: np.ndarray, pred_len: int) -> int:
+    """Infer a useful seasonal period from recent history.
+
+    The Weather dataset is hourly, so 24 and 168 are usually strong candidates.
+    The fallback still works for shorter custom CSV files.
+    """
+    h = np.asarray(history, dtype=np.float64).reshape(-1)
+    candidates = [24, 48, 72, 96, 120, 144, 168, max(12, pred_len)]
+    candidates = sorted({int(p) for p in candidates if 8 <= int(p) <= max(8, len(h) // 2)})
+    if not candidates:
+        return max(8, min(len(h), pred_len, 24))
+
+    scores = []
+    for p in candidates:
+        # Compare the most recent block with the previous block at lag p.
+        block = min(4 * p, len(h) - p)
+        scores.append((_safe_corr(h[-block:], h[-block - p: -p]), p))
+    scores.sort(reverse=True)
+    return int(scores[0][1])
+
+
+def seasonal_analog_demo_forecast(history: np.ndarray, pred_len: int) -> np.ndarray:
+    """A realistic non-ML demo baseline for UI presentation.
+
+    It is deliberately stronger than the old straight-line demo: it reuses daily/weekly
+    analog patterns, estimates a small trend, and applies a continuity correction so
+    the first predicted point starts near the last observed value. It never reads the
+    future target values, so backtest metrics remain honest.
+    """
+    h = np.asarray(history, dtype=np.float64).reshape(-1)
+    if len(h) == 0:
+        return np.zeros(pred_len, dtype=np.float64)
+    if len(h) == 1:
+        return np.repeat(h[-1], pred_len).astype(np.float64)
+
+    period = infer_weather_period(h, pred_len)
+    steps = np.arange(pred_len, dtype=np.float64)
+
+    # Candidate 1: repeat the nearest inferred seasonal cycle.
+    idx_main = (np.arange(pred_len) % period)
+    main_pattern = h[-period:][idx_main] if len(h) >= period else np.repeat(h[-1], pred_len)
+
+    # Candidate 2: for hourly Weather, daily pattern is often the most visually useful.
+    if len(h) >= 24:
+        daily_pattern = h[-24:][np.arange(pred_len) % 24]
+    else:
+        daily_pattern = main_pattern.copy()
+
+    # Candidate 3: weekly pattern when seq_len=336 gives at least two weeks of history.
+    if len(h) >= 168:
+        weekly_pattern = h[-168:][np.arange(pred_len) % 168]
+    else:
+        weekly_pattern = main_pattern.copy()
+
+    # Weighted seasonal analog. These weights make the demo follow oscillations instead
+    # of becoming a flat trend line, while still staying conservative.
+    pred = 0.50 * main_pattern + 0.30 * daily_pattern + 0.20 * weekly_pattern
+
+    # Add a small robust local trend. Median of recent differences is less sensitive
+    # to spikes than first-last slope. Damping prevents unrealistic drift.
+    recent = h[-min(len(h), max(24, period)): ]
+    diffs = np.diff(recent)
+    slope = float(np.median(diffs)) if len(diffs) else 0.0
+    trend_damping = np.exp(-steps / max(24.0, float(period)))
+    pred = pred + slope * (steps + 1.0) * trend_damping
+
+    # Continuity correction: start near the final observed point, then fade into the
+    # seasonal analog pattern. This removes the jump that makes demos look fake.
+    continuity_offset = float(h[-1] - pred[0])
+    fade = np.exp(-steps / max(6.0, float(period) / 4.0))
+    pred = pred + continuity_offset * fade
+
+    # Keep the demo inside a plausible envelope estimated from recent history.
+    q_low, q_high = np.quantile(recent, [0.01, 0.99])
+    spread = max(float(q_high - q_low), float(np.std(recent)), 1e-6)
+    lower = q_low - 0.25 * spread
+    upper = q_high + 0.25 * spread
+    return np.clip(pred, lower, upper).astype(np.float64)
+
+
 def run_demo_forecast(df: pd.DataFrame, cfg: ForecastConfig) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Dict[str, float]]:
     y = df[cfg.target].to_numpy(dtype=np.float64)
 
@@ -456,11 +551,7 @@ def run_demo_forecast(df: pd.DataFrame, cfg: ForecastConfig) -> Tuple[np.ndarray
         history = y[-cfg.seq_len:]
         true = None
 
-    last = float(history[-1])
-    local_slope = (float(history[-1]) - float(history[max(0, len(history) - 8)])) / max(1, min(8, len(history) - 1))
-    steps = np.arange(1, cfg.pred_len + 1)
-    seasonal = 0.05 * np.std(history) * np.sin(2 * np.pi * steps / max(24, cfg.pred_len))
-    pred = last + local_slope * steps + seasonal
+    pred = seasonal_analog_demo_forecast(history, cfg.pred_len)
     metrics = calculate_metrics(true, pred) if true is not None else {}
     return history, pred, true, metrics
 
@@ -634,7 +725,8 @@ def sidebar_settings(df: pd.DataFrame) -> ForecastConfig:
 def header() -> None:
     st.title("🌦️ CALF Weather Forecast")
     st.markdown(
-        "Upload the lightweight export ZIP from the notebook, or upload a Weather CSV and ONNX model manually."
+        "Upload the lightweight export ZIP from the notebook, or upload a Weather CSV and ONNX model manually. "
+        "The fallback demo uses a seasonal analog baseline so it looks closer to real weather dynamics."
     )
 
 
@@ -858,14 +950,14 @@ def main() -> None:
             options=["ONNX model", "Demo forecast"],
             index=0 if ONNX_PATH.exists() else 1,
             horizontal=True,
-            help="Use ONNX for real model inference. Demo forecast is only for checking the UI.",
+            help="Use ONNX for real model inference. Demo forecast now uses a seasonal analog baseline for a more realistic UI demo.",
         )
 
         if engine == "ONNX model" and not ONNX_PATH.exists():
             st.warning("No ONNX model found. Upload an ONNX file in Step 1, or use Demo forecast.")
 
         if engine == "Demo forecast":
-            st.warning("Demo forecast is only a UI sanity check. It is not CALF and can look flat/noisy.")
+            st.info("Demo forecast uses a seasonal analog baseline from the observed history. It is more realistic than the old flat demo, but it is still not CALF inference.")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Target", cfg.target)
@@ -884,7 +976,7 @@ def main() -> None:
                     st.success("Forecast completed with ONNX model.")
                 else:
                     history, pred, true, metrics = run_demo_forecast(df, cfg)
-                    st.warning("Demo forecast completed. This is not real CALF inference.")
+                    st.warning("Seasonal demo forecast completed. This is not real CALF inference; upload ONNX or saved result arrays for a true model demo.")
 
                 display_forecast_result(history, pred, true, metrics)
             except Exception as exc:
