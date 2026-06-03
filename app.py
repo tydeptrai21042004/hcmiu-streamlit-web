@@ -752,7 +752,24 @@ def show_status_cards(df: pd.DataFrame, data_label: str, data_path: Path, cfg: F
             st.json({k: meta.get(k) for k in ["dataset", "seq_len", "pred_len", "target", "target_idx", "train_ratio", "max_result_samples"] if k in meta})
 
 
-def display_forecast_result(history: np.ndarray, pred: np.ndarray, true: Optional[np.ndarray], metrics: Dict[str, float]) -> None:
+def display_forecast_result(
+    history: np.ndarray,
+    pred: np.ndarray,
+    true: Optional[np.ndarray],
+    metrics: Dict[str, float],
+    key_prefix: str = "forecast",
+) -> None:
+    """
+    Display one forecast result block.
+
+    key_prefix is important because Streamlit executes all tabs on every rerun.
+    The app can display both:
+      - a freshly-run forecast result
+      - a saved-results forecast result
+
+    Without unique keys, repeated st.download_button widgets cause:
+      StreamlitDuplicateElementId
+    """
     if metrics:
         st.subheader("Metrics")
         show_metrics(metrics)
@@ -772,12 +789,14 @@ def display_forecast_result(history: np.ndarray, pred: np.ndarray, true: Optiona
 
     st.subheader("Forecast values")
     st.dataframe(out, use_container_width=True, hide_index=True)
+
     st.download_button(
         "Download forecast CSV",
         data=out.to_csv(index=False).encode("utf-8"),
-        file_name="calf_forecast.csv",
+        file_name=f"{key_prefix}_calf_forecast.csv",
         mime="text/csv",
         use_container_width=True,
+        key=f"{key_prefix}_download_forecast_csv",
     )
 
 
@@ -831,7 +850,13 @@ def saved_results_view(df: pd.DataFrame, cfg: ForecastConfig) -> None:
 
     sample_metrics = calculate_metrics(true, pred)
     st.caption(f"Saved arrays use `{scaler_source}` for inverse scaling.")
-    display_forecast_result(history, pred, true, sample_metrics)
+    display_forecast_result(
+        history,
+        pred,
+        true,
+        sample_metrics,
+        key_prefix=f"saved_results_sample_{sample_idx}",
+    )
 
     if "metrics" in arrays:
         exported_metrics = metric_dict_from_array(arrays["metrics"])
@@ -978,7 +1003,13 @@ def main() -> None:
                     history, pred, true, metrics = run_demo_forecast(df, cfg)
                     st.warning("Seasonal demo forecast completed. This is not real CALF inference; upload ONNX or saved result arrays for a true model demo.")
 
-                display_forecast_result(history, pred, true, metrics)
+                display_forecast_result(
+                    history,
+                    pred,
+                    true,
+                    metrics,
+                    key_prefix="run_forecast_result",
+                )
             except Exception as exc:
                 st.exception(exc)
 
